@@ -53,6 +53,6 @@ app.post('/transfer', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Payment Service listening on port ${PORT}`);
+  console.log(`Payment API Microservice listening on port ${PORT}`);
 });
 
