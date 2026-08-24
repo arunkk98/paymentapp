@@ -1,0 +1,62 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rabbitmq
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/arunkk98/paymentapp.git'
+    targetRevision: main
+    path: paymentapp-gitops/apps/rabbitmq
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: payment-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: postgres
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/arunkk98/paymentapp.git'
+    targetRevision: main
+    path: paymentapp-gitops/apps/postgres
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: payment-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: redis
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/arunkk98/paymentapp.git'
+    targetRevision: main
+    path: paymentapp-gitops/apps/redis
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: payment-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

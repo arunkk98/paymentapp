@@ -1,0 +1,1776 @@
+[master]
+k8s-master-01 ansible_host=192.168.1.200
+
+[workers]
+k8s-worker-01 ansible_host=192.168.1.201
+k8s-worker-02 ansible_host=192.168.1.202
+
+[all:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_rsa
+ansible_python_interpreter=/usr/bin/python3
+---
+- name: PART 0 - AUTOMATED CLEANUP & HOSTNAME ENFORCEMENT
+  hosts: all
+  become: yes
+  tasks:
+    - name: Reset any existing kubeadm setup
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Clean up CNI configs and iptables
+      shell: |
+        rm -rf /etc/cni/net.d /etc/kubernetes/admin.conf $HOME/.kube/config
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+      ignore_errors: yes
+
+    - name: Set system hostname from inventory
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Ensure inventory hostname is in /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "127.0.1.1 {{ inventory_hostname }}"
+        regexp: '^127\.0\.1\.1'
+        state: present
+
+- name: PART 1 - SYSTEM PREPARATION (swap, modules, sysctl)
+  hosts: all
+  become: yes
+  tasks:
+    - name: Disable swap immediately
+      command: swapoff -a
+      ignore_errors: yes
+
+    - name: Remove swap from fstab permanently
+      replace:
+        path: /etc/fstab
+        regexp: '^.*swap.*$'
+        replace: ''
+
+    - name: Create k8s modules config
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Create sysctl config for k8s
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+
+    - name: Apply sysctl params
+      command: sysctl --system
+
+- name: PART 2 - INSTALL CONTAINER RUNTIME (containerd)
+  hosts: all
+  become: yes
+  tasks:
+    - name: Download containerd
+      get_url:
+        url: https://github.com/containerd/containerd/releases/download/v1.7.14/containerd-1.7.14-linux-amd64.tar.gz
+        dest: /tmp/containerd-1.7.14-linux-amd64.tar.gz
+
+    - name: Extract containerd to /usr/local
+      unarchive:
+        src: /tmp/containerd-1.7.14-linux-amd64.tar.gz
+        dest: /usr/local
+        remote_src: yes
+
+    - name: Download containerd service
+      get_url:
+        url: https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+        dest: /etc/systemd/system/containerd.service
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Generate containerd default config
+      shell: /usr/local/bin/containerd config default | tee /etc/containerd/config.toml
+
+    - name: Enable systemd cgroup
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Reload systemd and start containerd
+      systemd:
+        daemon_reload: yes
+        name: containerd
+        state: started
+        enabled: yes
+
+- name: PART 3 - INSTALL runc
+  hosts: all
+  become: yes
+  tasks:
+    - name: Download runc
+      get_url:
+        url: https://github.com/opencontainers/runc/releases/download/v1.1.12/runc.amd64
+        dest: /tmp/runc.amd64
+        mode: '0755'
+
+    - name: Install runc
+      copy:
+        src: /tmp/runc.amd64
+        dest: /usr/local/sbin/runc
+        mode: '0755'
+        remote_src: yes
+
+- name: PART 4 - INSTALL CNI PLUGINS
+  hosts: all
+  become: yes
+  tasks:
+    - name: Download CNI plugins
+      get_url:
+        url: https://github.com/containernetworking/plugins/releases/download/v1.5.0/cni-plugins-linux-amd64-v1.5.0.tgz
+        dest: /tmp/cni-plugins-linux-amd64-v1.5.0.tgz
+
+    - name: Create CNI bin directory
+      file:
+        path: /opt/cni/bin
+        state: directory
+
+    - name: Extract CNI plugins
+      unarchive:
+        src: /tmp/cni-plugins-linux-amd64-v1.5.0.tgz
+        dest: /opt/cni/bin
+        remote_src: yes
+
+- name: PART 5 - INSTALL KUBERNETES (kubeadm, kubelet, kubectl)
+  hosts: all
+  become: yes
+  tasks:
+    - name: Create apt keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Kubernetes GPG key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /tmp/kubernetes-release.key
+
+    - name: Install Kubernetes key
+      shell: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+
+- name: PART 6 - CONFIGURE CRICTL
+  hosts: all
+  become: yes
+  tasks:
+    - name: Configure crictl runtime endpoint
+      command: crictl config runtime-endpoint unix:///var/run/containerd/containerd.sock
+      ignore_errors: yes
+
+- name: PART 7 - INITIALIZE CONTROL PLANE (MASTER)
+  hosts: master
+  become: yes
+  tasks:
+    - name: Check if cluster already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: cluster_exists
+
+    - name: Initialize Kubernetes cluster
+      command: >
+        kubeadm init
+        --pod-network-cidr=192.168.0.0/16
+        --apiserver-advertise-address={{ hostvars[inventory_hostname]['ansible_host'] }}
+        --node-name={{ inventory_hostname }}
+      when: not cluster_exists.stat.exists
+
+    - name: Prepare kubeconfig directory
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+        mode: '0755'
+
+    - name: Copy admin.conf to kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+        remote_src: yes
+
+- name: PART 8 - INSTALL CALICO CNI
+  hosts: master
+  become: yes
+  tasks:
+    - name: Install Calico operator
+      command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+      ignore_errors: yes
+
+    - name: Download Calico custom resources
+      get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml
+        dest: /tmp/custom-resources.yaml
+
+    - name: Install Calico custom resources
+      command: kubectl apply -f /tmp/custom-resources.yaml
+      ignore_errors: yes
+
+- name: PART 9 - GET JOIN COMMAND
+  hosts: master
+  become: yes
+  tasks:
+    - name: Generate join command
+      command: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Save join command for workers
+      copy:
+        content: "{{ join_command.stdout }}"
+        dest: /tmp/join-command.txt
+      delegate_to: localhost
+
+- name: PART 10 - JOIN WORKER NODES
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Read join command
+      slurp:
+        src: /tmp/join-command.txt
+      register: join_cmd
+      delegate_to: localhost
+
+    - name: Join worker node
+      command: "{{ (join_cmd.content | b64decode).strip() }} --node-name={{ inventory_hostname }}"
+
+- name: PART 11 - FINAL VERIFICATION
+  hosts: master
+  become: yes
+  tasks:
+    - name: Get node status
+      command: kubectl get nodes -o wide
+      register: nodes
+
+    - name: Get all pods
+      command: kubectl get pods --all-namespaces
+      register: pods
+
+    - name: Final success message
+      debug:
+        msg:
+          - ""
+          - "╔══════════════════════════════════════════════════════════════════════╗"
+          - "║      ✅ KUBERNETES CLUSTER FULLY DEPLOYED & AUTOMATED! ✅            ║"
+          - "╚══════════════════════════════════════════════════════════════════════╝"
+          - ""
+          - "📊 NODE STATUS:"
+          - "{{ nodes.stdout_lines }}"
+          - ""
+          - "📦 PODS STATUS:"
+          - "{{ pods.stdout_lines }}"
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - vim
+  - curl
+  - wget
+  - git
+  - net-tools
+  - htop
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - python3
+  - python3-pip
+  - apt-transport-https
+  - qemu-guest-agent
+
+hostname: ${hostname}
+fqdn: ${hostname}.local
+preserve_hostname: false
+
+users:
+  - name: root
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+  - name: ansible
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    shell: /bin/bash
+
+ssh_pwauth: false
+disable_root: false
+
+runcmd:
+  - hostnamectl set-hostname ${hostname}
+  - systemctl enable qemu-guest-agent
+  - systemctl start qemu-guest-agent
+  - systemctl restart ssh
+  - echo "Kubernetes cluster node initialized" > /var/log/k8s-init.log
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    proxmox = {
+      source  = "bpg/proxmox"
+      version = ">= 0.66.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.5"
+    }
+  }
+
+  backend "local" {
+    path = "terraform.tfstate"
+  }
+}
+
+provider "proxmox" {
+  endpoint  = var.proxmox_api_url
+  api_token = var.proxmox_api_token
+  insecure  = true
+
+  ssh {
+    agent    = true
+    username = "root"
+  }
+}
+
+data "local_file" "ssh_public_key" {
+  filename = pathexpand("~/.ssh/id_rsa.pub")
+}
+
+resource "random_string" "cluster_token" {
+  length  = 8
+  special = false
+}
+
+# --- CLOUD-INIT SNIPPETS ---
+
+resource "proxmox_virtual_environment_file" "cloud_init_master" {
+  content_type = "snippets"
+  datastore_id = var.snippet_datastore
+  node_name    = var.proxmox_node
+
+  source_raw {
+    data = templatefile("${path.module}/cloud-init.tpl", {
+      hostname       = var.master_hostname
+      ssh_public_key = chomp(data.local_file.ssh_public_key.content)
+    })
+    file_name = "cloud-init-master-${random_string.cluster_token.result}.yaml"
+  }
+}
+
+resource "proxmox_virtual_environment_file" "cloud_init_workers" {
+  count        = var.worker_count
+  content_type = "snippets"
+  datastore_id = var.snippet_datastore
+  node_name    = var.proxmox_node
+
+  source_raw {
+    data = templatefile("${path.module}/cloud-init.tpl", {
+      hostname       = var.worker_hostnames[count.index]
+      ssh_public_key = chomp(data.local_file.ssh_public_key.content)
+    })
+    file_name = "cloud-init-worker-${count.index}-${random_string.cluster_token.result}.yaml"
+  }
+}
+
+# --- MASTER VM ---
+
+resource "proxmox_virtual_environment_vm" "k8s_master" {
+  name        = var.master_vm_name
+  description = "Kubernetes Master Node - Control Plane"
+  tags        = ["k8s", "master", "production"]
+
+  node_name = var.proxmox_node
+  vm_id     = var.master_vm_id
+
+  clone {
+    vm_id = var.template_id
+    full  = true
+  }
+
+  agent { enabled = true }
+
+  cpu {
+    cores = var.master_cpu_cores
+    type  = "host"
+  }
+
+  memory { dedicated = var.master_memory }
+
+  disk {
+    datastore_id = var.storage_datastore
+    interface    = "scsi0"
+    size         = var.master_disk_size
+  }
+
+  network_device {
+    bridge = var.network_bridge
+    model  = "virtio"
+  }
+
+  initialization {
+    ip_config {
+      ipv4 {
+        address = "${var.master_ip}/24"
+        gateway = var.network_gateway
+      }
+    }
+    dns { servers = var.dns_servers }
+    user_data_file_id = proxmox_virtual_environment_file.cloud_init_master.id
+  }
+}
+
+# --- WORKER VMs ---
+
+resource "proxmox_virtual_environment_vm" "k8s_workers" {
+  count       = var.worker_count
+  name        = var.worker_names[count.index]
+  description = "Kubernetes Worker Node ${count.index + 1}"
+  tags        = ["k8s", "worker", "production"]
+
+  node_name = var.proxmox_node
+  vm_id     = var.worker_ids[count.index]
+
+  clone {
+    vm_id = var.template_id
+    full  = true
+  }
+
+  agent { enabled = true }
+
+  cpu {
+    cores = var.worker_cpu_cores
+    type  = "host"
+  }
+
+  memory { dedicated = var.worker_memory }
+
+  disk {
+    datastore_id = var.storage_datastore
+    interface    = "scsi0"
+    size         = var.worker_disk_size
+  }
+
+  network_device {
+    bridge = var.network_bridge
+    model  = "virtio"
+  }
+
+  initialization {
+    ip_config {
+      ipv4 {
+        address = "${var.worker_ips[count.index]}/24"
+        gateway = var.network_gateway
+      }
+    }
+    dns { servers = var.dns_servers }
+    user_data_file_id = proxmox_virtual_environment_file.cloud_init_workers[count.index].id
+  }
+}
+output "master_ip" {
+  description = "IP address of the control plane node"
+  value       = var.master_ip
+}
+
+output "worker_ips" {
+  description = "IP addresses of all worker nodes"
+  value       = var.worker_ips
+}
+
+output "ssh_connections" {
+  description = "SSH quick connections"
+  value = concat(
+    ["ssh root@${var.master_ip}"],
+    [for ip in var.worker_ips : "ssh root@${ip}"]
+  )
+}
+{
+  "version": 4,
+  "terraform_version": "1.14.6",
+  "serial": 25,
+  "lineage": "e7f9b59f-2ce6-50c2-9a02-f473c6a8449a",
+  "outputs": {
+    "master_ip": {
+      "value": "192.168.1.200",
+      "type": "string"
+    },
+    "ssh_connections": {
+      "value": [
+        "ssh root@192.168.1.200",
+        "ssh root@192.168.1.201",
+        "ssh root@192.168.1.202"
+      ],
+      "type": [
+        "tuple",
+        [
+          "string",
+          "string",
+          "string"
+        ]
+      ]
+    },
+    "worker_ips": {
+      "value": [
+        "192.168.1.201",
+        "192.168.1.202"
+      ],
+      "type": [
+        "list",
+        "string"
+      ]
+    }
+  },
+  "resources": [
+    {
+      "mode": "data",
+      "type": "local_file",
+      "name": "ssh_public_key",
+      "provider": "provider[\"registry.terraform.io/hashicorp/local\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "content": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEy5azueqR5wR2mQWNHfHKIo5bHDTMS/UFlhwKx/SA6Mr3peOI/KDQUYLJH76vGk7Z2QB42yvCloi9kw88UQCmNHErU8UoukkTtUiPwM2pUYpjM+edcnZ+oTz8GuNuCXbM7kPj3uQtq9U38ANahBjuNCTGI00cNVGgrO25yim6KkggrBz7o6O4bQ/mYHh59qSptZVSm0XpsS1KeMXLORkg0bLtUA1cG9KZvawwpAdcAikmYbyiZLfp6a1n1f8fJWb1PwJQgQfmU03vhRNL/w+BmCvv2pUItvFTml14vPNoiHxJmDxpIniflr9jezvS4w+SLcatUHpJJZthhzuE5N3q5Dh/K1WkAGFpDIX0x7LBgsK7TxEmQKFV+EsUAPeN/jqyalzigA8+PKoS3P/TU2emOZK47eydsBPVCSK4PT5ahtnadoQ3LpfhhPXC1Go+l7V2avPqczo0Sgt24VISzZlHBFUQQ1c92BiKef2JpBbCtFTGjLP0jKfR823On3m69pKTdEL8EW/eHN2HKmTWXb/9YQz0/W7MJ+C8fR0jQDsBClmEuD/fsyxsQin03TpK3H4e8Al8uJW7icU9OPV2uMCD4T+m5PwBajOnL6W52MlEUhrFK4VDlP3HWkLsQSVCH5F0z7BRbkQrhKYILeBvNSzCXvKeJvBlViZCYX6vJPz5EQ== terraform@homelab\n",
+            "content_base64": "c3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFDQVFERXk1YXp1ZXFSNXdSMm1RV05IZkhLSW81YkhEVE1TL1VGbGh3S3gvU0E2TXIzcGVPSS9LRFFVWUxKSDc2dkdrN1oyUUI0Mnl2Q2xvaTlrdzg4VVFDbU5IRXJVOFVvdWtrVHRVaVB3TTJwVVlwak0rZWRjblorb1R6OEd1TnVDWGJNN2tQajN1UXRxOVUzOEFOYWhCanVOQ1RHSTAwY05WR2dyTzI1eWltNktrZ2dyQno3bzZPNGJRL21ZSGg1OXFTcHRaVlNtMFhwc1MxS2VNWExPUmtnMGJMdFVBMWNHOUtadmF3d3BBZGNBaWttWWJ5aVpMZnA2YTFuMWY4ZkpXYjFQd0pRZ1FmbVUwM3ZoUk5ML3crQm1DdnYycFVJdHZGVG1sMTR2UE5vaUh4Sm1EeHBJbmlmbHI5amV6dlM0dytTTGNhdFVIcEpKWnRoaHp1RTVOM3E1RGgvSzFXa0FHRnBESVgweDdMQmdzSzdUeEVtUUtGVitFc1VBUGVOL2pxeWFsemlnQTgrUEtvUzNQL1RVMmVtT1pLNDdleWRzQlBWQ1NLNFBUNWFodG5hZG9RM0xwZmhoUFhDMUdvK2w3VjJhdlBxY3pvMFNndDI0VklTelpsSEJGVVFRMWM5MkJpS2VmMkpwQmJDdEZUR2pMUDBqS2ZSODIzT24zbTY5cEtUZEVMOEVXL2VITjJIS21UV1hiLzlZUXowL1c3TUorQzhmUjBqUURzQkNsbUV1RC9mc3l4c1FpbjAzVHBLM0g0ZThBbDh1Slc3aWNVOU9QVjJ1TUNENFQrbTVQd0Jhak9uTDZXNTJNbEVVaHJGSzRWRGxQM0hXa0xzUVNWQ0g1RjB6N0JSYmtRcmhLWUlMZUJ2TlN6Q1h2S2VKdkJsVmlaQ1lYNnZKUHo1RVE9PSB0ZXJyYWZvcm1AaG9tZWxhYgo=",
+            "content_base64sha256": "a51ks9JbnFZaOZCqRxsSGt7L2oFc0Lte1s/sJXijR1Q=",
+            "content_base64sha512": "NBjcUe1I4lmLU/d9zdTfmfWZ0f2inwZZwnlW94ZTk46ajhP6b8tgWGTawQ4m+tJhGJGtWHa1aPOWDIoRYHDXUQ==",
+            "content_md5": "74465b2cd8fd58a9c6ca99a8e6ec51b1",
+            "content_sha1": "0d17483ae42c934cd7f429561e6ab500f67629db",
+            "content_sha256": "6b9d64b3d25b9c565a3990aa471b121adecbda815cd0bb5ed6cfec2578a34754",
+            "content_sha512": "3418dc51ed48e2598b53f77dcdd4df99f599d1fda29f0659c27956f78653938e9a8e13fa6fcb605864dac10e26fad2611891ad5876b568f3960c8a116070d751",
+            "filename": "/home/ak/.ssh/id_rsa.pub",
+            "id": "0d17483ae42c934cd7f429561e6ab500f67629db"
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "proxmox_virtual_environment_file",
+      "name": "cloud_init_master",
+      "provider": "provider[\"registry.terraform.io/bpg/proxmox\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "content_type": "snippets",
+            "datastore_id": "hdd1tb",
+            "file_mode": null,
+            "file_modification_date": null,
+            "file_name": "cloud-init-master-NQXFfFu2.yaml",
+            "file_size": null,
+            "file_tag": null,
+            "id": "hdd1tb:snippets/cloud-init-master-NQXFfFu2.yaml",
+            "node_name": "pve",
+            "overwrite": true,
+            "source_file": [],
+            "source_raw": [
+              {
+                "data": "#cloud-config\npackage_update: true\npackage_upgrade: true\n\npackages:\n  - vim\n  - curl\n  - wget\n  - git\n  - net-tools\n  - htop\n  - ca-certificates\n  - gnupg\n  - lsb-release\n  - python3\n  - python3-pip\n  - apt-transport-https\n  - qemu-guest-agent\n\nhostname: k8s-master-01\nfqdn: k8s-master-01.local\npreserve_hostname: false\n\nusers:\n  - name: root\n    ssh_authorized_keys:\n      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEy5azueqR5wR2mQWNHfHKIo5bHDTMS/UFlhwKx/SA6Mr3peOI/KDQUYLJH76vGk7Z2QB42yvCloi9kw88UQCmNHErU8UoukkTtUiPwM2pUYpjM+edcnZ+oTz8GuNuCXbM7kPj3uQtq9U38ANahBjuNCTGI00cNVGgrO25yim6KkggrBz7o6O4bQ/mYHh59qSptZVSm0XpsS1KeMXLORkg0bLtUA1cG9KZvawwpAdcAikmYbyiZLfp6a1n1f8fJWb1PwJQgQfmU03vhRNL/w+BmCvv2pUItvFTml14vPNoiHxJmDxpIniflr9jezvS4w+SLcatUHpJJZthhzuE5N3q5Dh/K1WkAGFpDIX0x7LBgsK7TxEmQKFV+EsUAPeN/jqyalzigA8+PKoS3P/TU2emOZK47eydsBPVCSK4PT5ahtnadoQ3LpfhhPXC1Go+l7V2avPqczo0Sgt24VISzZlHBFUQQ1c92BiKef2JpBbCtFTGjLP0jKfR823On3m69pKTdEL8EW/eHN2HKmTWXb/9YQz0/W7MJ+C8fR0jQDsBClmEuD/fsyxsQin03TpK3H4e8Al8uJW7icU9OPV2uMCD4T+m5PwBajOnL6W52MlEUhrFK4VDlP3HWkLsQSVCH5F0z7BRbkQrhKYILeBvNSzCXvKeJvBlViZCYX6vJPz5EQ== terraform@homelab\n\n  - name: ansible\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    ssh_authorized_keys:\n      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEy5azueqR5wR2mQWNHfHKIo5bHDTMS/UFlhwKx/SA6Mr3peOI/KDQUYLJH76vGk7Z2QB42yvCloi9kw88UQCmNHErU8UoukkTtUiPwM2pUYpjM+edcnZ+oTz8GuNuCXbM7kPj3uQtq9U38ANahBjuNCTGI00cNVGgrO25yim6KkggrBz7o6O4bQ/mYHh59qSptZVSm0XpsS1KeMXLORkg0bLtUA1cG9KZvawwpAdcAikmYbyiZLfp6a1n1f8fJWb1PwJQgQfmU03vhRNL/w+BmCvv2pUItvFTml14vPNoiHxJmDxpIniflr9jezvS4w+SLcatUHpJJZthhzuE5N3q5Dh/K1WkAGFpDIX0x7LBgsK7TxEmQKFV+EsUAPeN/jqyalzigA8+PKoS3P/TU2emOZK47eydsBPVCSK4PT5ahtnadoQ3LpfhhPXC1Go+l7V2avPqczo0Sgt24VISzZlHBFUQQ1c92BiKef2JpBbCtFTGjLP0jKfR823On3m69pKTdEL8EW/eHN2HKmTWXb/9YQz0/W7MJ+C8fR0jQDsBClmEuD/fsyxsQin03TpK3H4e8Al8uJW7icU9OPV2uMCD4T+m5PwBajOnL6W52MlEUhrFK4VDlP3HWkLsQSVCH5F0z7BRbkQrhKYILeBvNSzCXvKeJvBlViZCYX6vJPz5EQ== terraform@homelab\n    shell: /bin/bash\n\nssh_pwauth: false\ndisable_root: false\n\nruncmd:\n  - hostnamectl set-hostname k8s-master-01\n  - systemctl enable qemu-guest-agent\n  - systemctl start qemu-guest-agent\n  - systemctl restart ssh\n  - echo \"Kubernetes cluster node initialized\" \u003e /var/log/k8s-init.log\n",
+                "file_name": "cloud-init-master-NQXFfFu2.yaml",
+                "resize": 0
+              }
+            ],
+            "timeout_upload": 1800,
+            "upload_mode": "stream"
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA==",
+          "dependencies": [
+            "data.local_file.ssh_public_key",
+            "random_string.cluster_token"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "proxmox_virtual_environment_file",
+      "name": "cloud_init_workers",
+      "provider": "provider[\"registry.terraform.io/bpg/proxmox\"]",
+      "instances": [
+        {
+          "index_key": 0,
+          "schema_version": 0,
+          "attributes": {
+            "content_type": "snippets",
+            "datastore_id": "hdd1tb",
+            "file_mode": null,
+            "file_modification_date": null,
+            "file_name": "cloud-init-worker-0-NQXFfFu2.yaml",
+            "file_size": null,
+            "file_tag": null,
+            "id": "hdd1tb:snippets/cloud-init-worker-0-NQXFfFu2.yaml",
+            "node_name": "pve",
+            "overwrite": true,
+            "source_file": [],
+            "source_raw": [
+              {
+                "data": "#cloud-config\npackage_update: true\npackage_upgrade: true\n\npackages:\n  - vim\n  - curl\n  - wget\n  - git\n  - net-tools\n  - htop\n  - ca-certificates\n  - gnupg\n  - lsb-release\n  - python3\n  - python3-pip\n  - apt-transport-https\n  - qemu-guest-agent\n\nhostname: k8s-worker-01\nfqdn: k8s-worker-01.local\npreserve_hostname: false\n\nusers:\n  - name: root\n    ssh_authorized_keys:\n      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEy5azueqR5wR2mQWNHfHKIo5bHDTMS/UFlhwKx/SA6Mr3peOI/KDQUYLJH76vGk7Z2QB42yvCloi9kw88UQCmNHErU8UoukkTtUiPwM2pUYpjM+edcnZ+oTz8GuNuCXbM7kPj3uQtq9U38ANahBjuNCTGI00cNVGgrO25yim6KkggrBz7o6O4bQ/mYHh59qSptZVSm0XpsS1KeMXLORkg0bLtUA1cG9KZvawwpAdcAikmYbyiZLfp6a1n1f8fJWb1PwJQgQfmU03vhRNL/w+BmCvv2pUItvFTml14vPNoiHxJmDxpIniflr9jezvS4w+SLcatUHpJJZthhzuE5N3q5Dh/K1WkAGFpDIX0x7LBgsK7TxEmQKFV+EsUAPeN/jqyalzigA8+PKoS3P/TU2emOZK47eydsBPVCSK4PT5ahtnadoQ3LpfhhPXC1Go+l7V2avPqczo0Sgt24VISzZlHBFUQQ1c92BiKef2JpBbCtFTGjLP0jKfR823On3m69pKTdEL8EW/eHN2HKmTWXb/9YQz0/W7MJ+C8fR0jQDsBClmEuD/fsyxsQin03TpK3H4e8Al8uJW7icU9OPV2uMCD4T+m5PwBajOnL6W52MlEUhrFK4VDlP3HWkLsQSVCH5F0z7BRbkQrhKYILeBvNSzCXvKeJvBlViZCYX6vJPz5EQ== terraform@homelab\n\n  - name: ansible\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    ssh_authorized_keys:\n      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEy5azueqR5wR2mQWNHfHKIo5bHDTMS/UFlhwKx/SA6Mr3peOI/KDQUYLJH76vGk7Z2QB42yvCloi9kw88UQCmNHErU8UoukkTtUiPwM2pUYpjM+edcnZ+oTz8GuNuCXbM7kPj3uQtq9U38ANahBjuNCTGI00cNVGgrO25yim6KkggrBz7o6O4bQ/mYHh59qSptZVSm0XpsS1KeMXLORkg0bLtUA1cG9KZvawwpAdcAikmYbyiZLfp6a1n1f8fJWb1PwJQgQfmU03vhRNL/w+BmCvv2pUItvFTml14vPNoiHxJmDxpIniflr9jezvS4w+SLcatUHpJJZthhzuE5N3q5Dh/K1WkAGFpDIX0x7LBgsK7TxEmQKFV+EsUAPeN/jqyalzigA8+PKoS3P/TU2emOZK47eydsBPVCSK4PT5ahtnadoQ3LpfhhPXC1Go+l7V2avPqczo0Sgt24VISzZlHBFUQQ1c92BiKef2JpBbCtFTGjLP0jKfR823On3m69pKTdEL8EW/eHN2HKmTWXb/9YQz0/W7MJ+C8fR0jQDsBClmEuD/fsyxsQin03TpK3H4e8Al8uJW7icU9OPV2uMCD4T+m5PwBajOnL6W52MlEUhrFK4VDlP3HWkLsQSVCH5F0z7BRbkQrhKYILeBvNSzCXvKeJvBlViZCYX6vJPz5EQ== terraform@homelab\n    shell: /bin/bash\n\nssh_pwauth: false\ndisable_root: false\n\nruncmd:\n  - hostnamectl set-hostname k8s-worker-01\n  - systemctl enable qemu-guest-agent\n  - systemctl start qemu-guest-agent\n  - systemctl restart ssh\n  - echo \"Kubernetes cluster node initialized\" \u003e /var/log/k8s-init.log\n",
+                "file_name": "cloud-init-worker-0-NQXFfFu2.yaml",
+                "resize": 0
+              }
+            ],
+            "timeout_upload": 1800,
+            "upload_mode": "stream"
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA==",
+          "dependencies": [
+            "data.local_file.ssh_public_key",
+            "random_string.cluster_token"
+          ]
+        },
+        {
+          "index_key": 1,
+          "schema_version": 0,
+          "attributes": {
+            "content_type": "snippets",
+            "datastore_id": "hdd1tb",
+            "file_mode": null,
+            "file_modification_date": null,
+            "file_name": "cloud-init-worker-1-NQXFfFu2.yaml",
+            "file_size": null,
+            "file_tag": null,
+            "id": "hdd1tb:snippets/cloud-init-worker-1-NQXFfFu2.yaml",
+            "node_name": "pve",
+            "overwrite": true,
+            "source_file": [],
+            "source_raw": [
+              {
+                "data": "#cloud-config\npackage_update: true\npackage_upgrade: true\n\npackages:\n  - vim\n  - curl\n  - wget\n  - git\n  - net-tools\n  - htop\n  - ca-certificates\n  - gnupg\n  - lsb-release\n  - python3\n  - python3-pip\n  - apt-transport-https\n  - qemu-guest-agent\n\nhostname: k8s-worker-02\nfqdn: k8s-worker-02.local\npreserve_hostname: false\n\nusers:\n  - name: root\n    ssh_authorized_keys:\n      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEy5azueqR5wR2mQWNHfHKIo5bHDTMS/UFlhwKx/SA6Mr3peOI/KDQUYLJH76vGk7Z2QB42yvCloi9kw88UQCmNHErU8UoukkTtUiPwM2pUYpjM+edcnZ+oTz8GuNuCXbM7kPj3uQtq9U38ANahBjuNCTGI00cNVGgrO25yim6KkggrBz7o6O4bQ/mYHh59qSptZVSm0XpsS1KeMXLORkg0bLtUA1cG9KZvawwpAdcAikmYbyiZLfp6a1n1f8fJWb1PwJQgQfmU03vhRNL/w+BmCvv2pUItvFTml14vPNoiHxJmDxpIniflr9jezvS4w+SLcatUHpJJZthhzuE5N3q5Dh/K1WkAGFpDIX0x7LBgsK7TxEmQKFV+EsUAPeN/jqyalzigA8+PKoS3P/TU2emOZK47eydsBPVCSK4PT5ahtnadoQ3LpfhhPXC1Go+l7V2avPqczo0Sgt24VISzZlHBFUQQ1c92BiKef2JpBbCtFTGjLP0jKfR823On3m69pKTdEL8EW/eHN2HKmTWXb/9YQz0/W7MJ+C8fR0jQDsBClmEuD/fsyxsQin03TpK3H4e8Al8uJW7icU9OPV2uMCD4T+m5PwBajOnL6W52MlEUhrFK4VDlP3HWkLsQSVCH5F0z7BRbkQrhKYILeBvNSzCXvKeJvBlViZCYX6vJPz5EQ== terraform@homelab\n\n  - name: ansible\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    ssh_authorized_keys:\n      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEy5azueqR5wR2mQWNHfHKIo5bHDTMS/UFlhwKx/SA6Mr3peOI/KDQUYLJH76vGk7Z2QB42yvCloi9kw88UQCmNHErU8UoukkTtUiPwM2pUYpjM+edcnZ+oTz8GuNuCXbM7kPj3uQtq9U38ANahBjuNCTGI00cNVGgrO25yim6KkggrBz7o6O4bQ/mYHh59qSptZVSm0XpsS1KeMXLORkg0bLtUA1cG9KZvawwpAdcAikmYbyiZLfp6a1n1f8fJWb1PwJQgQfmU03vhRNL/w+BmCvv2pUItvFTml14vPNoiHxJmDxpIniflr9jezvS4w+SLcatUHpJJZthhzuE5N3q5Dh/K1WkAGFpDIX0x7LBgsK7TxEmQKFV+EsUAPeN/jqyalzigA8+PKoS3P/TU2emOZK47eydsBPVCSK4PT5ahtnadoQ3LpfhhPXC1Go+l7V2avPqczo0Sgt24VISzZlHBFUQQ1c92BiKef2JpBbCtFTGjLP0jKfR823On3m69pKTdEL8EW/eHN2HKmTWXb/9YQz0/W7MJ+C8fR0jQDsBClmEuD/fsyxsQin03TpK3H4e8Al8uJW7icU9OPV2uMCD4T+m5PwBajOnL6W52MlEUhrFK4VDlP3HWkLsQSVCH5F0z7BRbkQrhKYILeBvNSzCXvKeJvBlViZCYX6vJPz5EQ== terraform@homelab\n    shell: /bin/bash\n\nssh_pwauth: false\ndisable_root: false\n\nruncmd:\n  - hostnamectl set-hostname k8s-worker-02\n  - systemctl enable qemu-guest-agent\n  - systemctl start qemu-guest-agent\n  - systemctl restart ssh\n  - echo \"Kubernetes cluster node initialized\" \u003e /var/log/k8s-init.log\n",
+                "file_name": "cloud-init-worker-1-NQXFfFu2.yaml",
+                "resize": 0
+              }
+            ],
+            "timeout_upload": 1800,
+            "upload_mode": "stream"
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA==",
+          "dependencies": [
+            "data.local_file.ssh_public_key",
+            "random_string.cluster_token"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "proxmox_virtual_environment_vm",
+      "name": "k8s_master",
+      "provider": "provider[\"registry.terraform.io/bpg/proxmox\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "acpi": true,
+            "agent": [
+              {
+                "enabled": true,
+                "timeout": "15m",
+                "trim": false,
+                "type": "virtio",
+                "wait_for_ip": []
+              }
+            ],
+            "amd_sev": [],
+            "audio_device": [],
+            "bios": "seabios",
+            "boot_order": [],
+            "cdrom": [],
+            "clone": [
+              {
+                "datastore_id": "",
+                "full": true,
+                "node_name": "",
+                "retries": 1,
+                "vm_id": 100
+              }
+            ],
+            "cpu": [
+              {
+                "affinity": "",
+                "architecture": "",
+                "cores": 2,
+                "flags": null,
+                "hotplugged": 0,
+                "limit": 0,
+                "numa": false,
+                "sockets": 1,
+                "type": "host",
+                "units": 0
+              }
+            ],
+            "delete_unreferenced_disks_on_destroy": true,
+            "description": "Kubernetes Master Node - Control Plane",
+            "disk": [
+              {
+                "aio": "io_uring",
+                "backup": true,
+                "cache": "none",
+                "datastore_id": "hdd1tb",
+                "discard": "ignore",
+                "file_format": "raw",
+                "file_id": "",
+                "import_from": "",
+                "interface": "scsi0",
+                "iothread": false,
+                "path_in_datastore": "200/vm-200-disk-0.raw",
+                "queues": 0,
+                "replicate": true,
+                "serial": "",
+                "size": 2,
+                "speed": [],
+                "ssd": false
+              }
+            ],
+            "efi_disk": [],
+            "hook_script_file_id": null,
+            "hostpci": [],
+            "hotplug": null,
+            "id": "200",
+            "initialization": [
+              {
+                "datastore_id": "local-lvm",
+                "dns": [
+                  {
+                    "domain": "",
+                    "servers": [
+                      "1.1.1.1",
+                      "8.8.8.8"
+                    ]
+                  }
+                ],
+                "file_format": "",
+                "interface": "ide2",
+                "ip_config": [
+                  {
+                    "ipv4": [
+                      {
+                        "address": "192.168.1.200/24",
+                        "gateway": "192.168.1.1"
+                      }
+                    ],
+                    "ipv6": []
+                  }
+                ],
+                "meta_data_file_id": "",
+                "network_data_file_id": "",
+                "type": "",
+                "upgrade": true,
+                "user_account": [],
+                "user_data_file_id": "hdd1tb:snippets/cloud-init-master-NQXFfFu2.yaml",
+                "vendor_data_file_id": ""
+              }
+            ],
+            "ipv4_addresses": [
+              [
+                "127.0.0.1"
+              ],
+              [
+                "192.168.1.200"
+              ]
+            ],
+            "ipv6_addresses": [
+              [
+                "::1"
+              ],
+              [
+                "fe80::be24:11ff:fea9:d994"
+              ]
+            ],
+            "keyboard_layout": "en-us",
+            "kvm_arguments": null,
+            "mac_addresses": [
+              "00:00:00:00:00:00",
+              "BC:24:11:A9:D9:94"
+            ],
+            "machine": null,
+            "memory": [
+              {
+                "dedicated": 2048,
+                "floating": 0,
+                "hugepages": "",
+                "keep_hugepages": false,
+                "shared": 0
+              }
+            ],
+            "migrate": false,
+            "name": "k8s-master-01",
+            "network_device": [
+              {
+                "bridge": "vmbr0",
+                "disconnected": false,
+                "enabled": true,
+                "firewall": false,
+                "mac_address": "BC:24:11:A9:D9:94",
+                "model": "virtio",
+                "mtu": 0,
+                "queues": 0,
+                "rate_limit": 0,
+                "trunks": "",
+                "vlan_id": 0
+              }
+            ],
+            "network_interface_names": [
+              "lo",
+              "eth0"
+            ],
+            "node_name": "pve",
+            "numa": [],
+            "on_boot": true,
+            "operating_system": [],
+            "pool_id": "",
+            "protection": false,
+            "purge_on_destroy": true,
+            "reboot": false,
+            "reboot_after_update": true,
+            "rng": [],
+            "scsi_hardware": "virtio-scsi-pci",
+            "serial_device": [],
+            "smbios": [],
+            "started": true,
+            "startup": [],
+            "stop_on_destroy": false,
+            "tablet_device": true,
+            "tags": [
+              "k8s",
+              "master",
+              "production"
+            ],
+            "template": false,
+            "timeout_clone": 1800,
+            "timeout_create": 1800,
+            "timeout_migrate": 1800,
+            "timeout_move_disk": 1800,
+            "timeout_reboot": 1800,
+            "timeout_shutdown_vm": 1800,
+            "timeout_start_vm": 1800,
+            "timeout_stop_vm": 300,
+            "tpm_state": [],
+            "usb": [],
+            "vga": [
+              {
+                "clipboard": "",
+                "memory": 16,
+                "type": "serial0"
+              }
+            ],
+            "virtiofs": [],
+            "vm_id": 200,
+            "watchdog": []
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA==",
+          "dependencies": [
+            "data.local_file.ssh_public_key",
+            "proxmox_virtual_environment_file.cloud_init_master",
+            "random_string.cluster_token"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "proxmox_virtual_environment_vm",
+      "name": "k8s_workers",
+      "provider": "provider[\"registry.terraform.io/bpg/proxmox\"]",
+      "instances": [
+        {
+          "index_key": 0,
+          "schema_version": 0,
+          "attributes": {
+            "acpi": true,
+            "agent": [
+              {
+                "enabled": true,
+                "timeout": "15m",
+                "trim": false,
+                "type": "virtio",
+                "wait_for_ip": []
+              }
+            ],
+            "amd_sev": [],
+            "audio_device": [],
+            "bios": "seabios",
+            "boot_order": [],
+            "cdrom": [],
+            "clone": [
+              {
+                "datastore_id": "",
+                "full": true,
+                "node_name": "",
+                "retries": 1,
+                "vm_id": 100
+              }
+            ],
+            "cpu": [
+              {
+                "affinity": "",
+                "architecture": "",
+                "cores": 2,
+                "flags": null,
+                "hotplugged": 0,
+                "limit": 0,
+                "numa": false,
+                "sockets": 1,
+                "type": "host",
+                "units": 0
+              }
+            ],
+            "delete_unreferenced_disks_on_destroy": true,
+            "description": "Kubernetes Worker Node 1",
+            "disk": [
+              {
+                "aio": "io_uring",
+                "backup": true,
+                "cache": "none",
+                "datastore_id": "hdd1tb",
+                "discard": "ignore",
+                "file_format": "raw",
+                "file_id": "",
+                "import_from": "",
+                "interface": "scsi0",
+                "iothread": false,
+                "path_in_datastore": "201/vm-201-disk-0.raw",
+                "queues": 0,
+                "replicate": true,
+                "serial": "",
+                "size": 2,
+                "speed": [],
+                "ssd": false
+              }
+            ],
+            "efi_disk": [],
+            "hook_script_file_id": null,
+            "hostpci": [],
+            "hotplug": null,
+            "id": "201",
+            "initialization": [
+              {
+                "datastore_id": "local-lvm",
+                "dns": [
+                  {
+                    "domain": "",
+                    "servers": [
+                      "1.1.1.1",
+                      "8.8.8.8"
+                    ]
+                  }
+                ],
+                "file_format": "",
+                "interface": "ide2",
+                "ip_config": [
+                  {
+                    "ipv4": [
+                      {
+                        "address": "192.168.1.201/24",
+                        "gateway": "192.168.1.1"
+                      }
+                    ],
+                    "ipv6": []
+                  }
+                ],
+                "meta_data_file_id": "",
+                "network_data_file_id": "",
+                "type": "",
+                "upgrade": true,
+                "user_account": [],
+                "user_data_file_id": "hdd1tb:snippets/cloud-init-worker-0-NQXFfFu2.yaml",
+                "vendor_data_file_id": ""
+              }
+            ],
+            "ipv4_addresses": [
+              [
+                "127.0.0.1"
+              ],
+              [
+                "192.168.1.201"
+              ]
+            ],
+            "ipv6_addresses": [
+              [
+                "::1"
+              ],
+              [
+                "fe80::be24:11ff:fe10:760b"
+              ]
+            ],
+            "keyboard_layout": "en-us",
+            "kvm_arguments": null,
+            "mac_addresses": [
+              "00:00:00:00:00:00",
+              "BC:24:11:10:76:0B"
+            ],
+            "machine": null,
+            "memory": [
+              {
+                "dedicated": 4608,
+                "floating": 0,
+                "hugepages": "",
+                "keep_hugepages": false,
+                "shared": 0
+              }
+            ],
+            "migrate": false,
+            "name": "k8s-worker-01",
+            "network_device": [
+              {
+                "bridge": "vmbr0",
+                "disconnected": false,
+                "enabled": true,
+                "firewall": false,
+                "mac_address": "BC:24:11:10:76:0B",
+                "model": "virtio",
+                "mtu": 0,
+                "queues": 0,
+                "rate_limit": 0,
+                "trunks": "",
+                "vlan_id": 0
+              }
+            ],
+            "network_interface_names": [
+              "lo",
+              "eth0"
+            ],
+            "node_name": "pve",
+            "numa": [],
+            "on_boot": true,
+            "operating_system": [],
+            "pool_id": "",
+            "protection": false,
+            "purge_on_destroy": true,
+            "reboot": false,
+            "reboot_after_update": true,
+            "rng": [],
+            "scsi_hardware": "virtio-scsi-pci",
+            "serial_device": [],
+            "smbios": [],
+            "started": true,
+            "startup": [],
+            "stop_on_destroy": false,
+            "tablet_device": true,
+            "tags": [
+              "k8s",
+              "production",
+              "worker"
+            ],
+            "template": false,
+            "timeout_clone": 1800,
+            "timeout_create": 1800,
+            "timeout_migrate": 1800,
+            "timeout_move_disk": 1800,
+            "timeout_reboot": 1800,
+            "timeout_shutdown_vm": 1800,
+            "timeout_start_vm": 1800,
+            "timeout_stop_vm": 300,
+            "tpm_state": [],
+            "usb": [],
+            "vga": [
+              {
+                "clipboard": "",
+                "memory": 16,
+                "type": "serial0"
+              }
+            ],
+            "virtiofs": [],
+            "vm_id": 201,
+            "watchdog": []
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA==",
+          "dependencies": [
+            "data.local_file.ssh_public_key",
+            "proxmox_virtual_environment_file.cloud_init_workers",
+            "random_string.cluster_token"
+          ]
+        },
+        {
+          "index_key": 1,
+          "schema_version": 0,
+          "attributes": {
+            "acpi": true,
+            "agent": [
+              {
+                "enabled": true,
+                "timeout": "15m",
+                "trim": false,
+                "type": "virtio",
+                "wait_for_ip": []
+              }
+            ],
+            "amd_sev": [],
+            "audio_device": [],
+            "bios": "seabios",
+            "boot_order": [],
+            "cdrom": [],
+            "clone": [
+              {
+                "datastore_id": "",
+                "full": true,
+                "node_name": "",
+                "retries": 1,
+                "vm_id": 100
+              }
+            ],
+            "cpu": [
+              {
+                "affinity": "",
+                "architecture": "",
+                "cores": 2,
+                "flags": null,
+                "hotplugged": 0,
+                "limit": 0,
+                "numa": false,
+                "sockets": 1,
+                "type": "host",
+                "units": 0
+              }
+            ],
+            "delete_unreferenced_disks_on_destroy": true,
+            "description": "Kubernetes Worker Node 2",
+            "disk": [
+              {
+                "aio": "io_uring",
+                "backup": true,
+                "cache": "none",
+                "datastore_id": "hdd1tb",
+                "discard": "ignore",
+                "file_format": "raw",
+                "file_id": "",
+                "import_from": "",
+                "interface": "scsi0",
+                "iothread": false,
+                "path_in_datastore": "202/vm-202-disk-0.raw",
+                "queues": 0,
+                "replicate": true,
+                "serial": "",
+                "size": 2,
+                "speed": [],
+                "ssd": false
+              }
+            ],
+            "efi_disk": [],
+            "hook_script_file_id": null,
+            "hostpci": [],
+            "hotplug": null,
+            "id": "202",
+            "initialization": [
+              {
+                "datastore_id": "local-lvm",
+                "dns": [
+                  {
+                    "domain": "",
+                    "servers": [
+                      "1.1.1.1",
+                      "8.8.8.8"
+                    ]
+                  }
+                ],
+                "file_format": "",
+                "interface": "ide2",
+                "ip_config": [
+                  {
+                    "ipv4": [
+                      {
+                        "address": "192.168.1.202/24",
+                        "gateway": "192.168.1.1"
+                      }
+                    ],
+                    "ipv6": []
+                  }
+                ],
+                "meta_data_file_id": "",
+                "network_data_file_id": "",
+                "type": "",
+                "upgrade": true,
+                "user_account": [],
+                "user_data_file_id": "hdd1tb:snippets/cloud-init-worker-1-NQXFfFu2.yaml",
+                "vendor_data_file_id": ""
+              }
+            ],
+            "ipv4_addresses": [
+              [
+                "127.0.0.1"
+              ],
+              [
+                "192.168.1.202"
+              ]
+            ],
+            "ipv6_addresses": [
+              [
+                "::1"
+              ],
+              [
+                "fe80::be24:11ff:fe01:3190"
+              ]
+            ],
+            "keyboard_layout": "en-us",
+            "kvm_arguments": null,
+            "mac_addresses": [
+              "00:00:00:00:00:00",
+              "BC:24:11:01:31:90"
+            ],
+            "machine": null,
+            "memory": [
+              {
+                "dedicated": 4608,
+                "floating": 0,
+                "hugepages": "",
+                "keep_hugepages": false,
+                "shared": 0
+              }
+            ],
+            "migrate": false,
+            "name": "k8s-worker-02",
+            "network_device": [
+              {
+                "bridge": "vmbr0",
+                "disconnected": false,
+                "enabled": true,
+                "firewall": false,
+                "mac_address": "BC:24:11:01:31:90",
+                "model": "virtio",
+                "mtu": 0,
+                "queues": 0,
+                "rate_limit": 0,
+                "trunks": "",
+                "vlan_id": 0
+              }
+            ],
+            "network_interface_names": [
+              "lo",
+              "eth0"
+            ],
+            "node_name": "pve",
+            "numa": [],
+            "on_boot": true,
+            "operating_system": [],
+            "pool_id": "",
+            "protection": false,
+            "purge_on_destroy": true,
+            "reboot": false,
+            "reboot_after_update": true,
+            "rng": [],
+            "scsi_hardware": "virtio-scsi-pci",
+            "serial_device": [],
+            "smbios": [],
+            "started": true,
+            "startup": [],
+            "stop_on_destroy": false,
+            "tablet_device": true,
+            "tags": [
+              "k8s",
+              "production",
+              "worker"
+            ],
+            "template": false,
+            "timeout_clone": 1800,
+            "timeout_create": 1800,
+            "timeout_migrate": 1800,
+            "timeout_move_disk": 1800,
+            "timeout_reboot": 1800,
+            "timeout_shutdown_vm": 1800,
+            "timeout_start_vm": 1800,
+            "timeout_stop_vm": 300,
+            "tpm_state": [],
+            "usb": [],
+            "vga": [
+              {
+                "clipboard": "",
+                "memory": 16,
+                "type": "serial0"
+              }
+            ],
+            "virtiofs": [],
+            "vm_id": 202,
+            "watchdog": []
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0,
+          "private": "bnVsbA==",
+          "dependencies": [
+            "data.local_file.ssh_public_key",
+            "proxmox_virtual_environment_file.cloud_init_workers",
+            "random_string.cluster_token"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "random_string",
+      "name": "cluster_token",
+      "provider": "provider[\"registry.terraform.io/hashicorp/random\"]",
+      "instances": [
+        {
+          "schema_version": 2,
+          "attributes": {
+            "id": "NQXFfFu2",
+            "keepers": null,
+            "length": 8,
+            "lower": true,
+            "min_lower": 0,
+            "min_numeric": 0,
+            "min_special": 0,
+            "min_upper": 0,
+            "number": true,
+            "numeric": true,
+            "override_special": null,
+            "result": "NQXFfFu2",
+            "special": false,
+            "upper": true
+          },
+          "sensitive_attributes": [],
+          "identity_schema_version": 0
+        }
+      ]
+    }
+  ],
+  "check_results": null
+}
+{
+  "version": 4,
+  "terraform_version": "1.14.6",
+  "serial": 17,
+  "lineage": "e7f9b59f-2ce6-50c2-9a02-f473c6a8449a",
+  "outputs": {},
+  "resources": [],
+  "check_results": null
+}
+# Connection & Storage
+proxmox_api_url   = "https://192.168.1.3:8006/api2/json"
+proxmox_api_token = "root@pam!terraform=ad6d6468-7e91-4d93-bc01-b7d62e36da55"
+proxmox_node      = "pve"
+template_id       = 100
+storage_datastore = "hdd1tb"
+snippet_datastore = "hdd1tb"
+
+# Networking
+network_bridge  = "vmbr0"
+network_gateway = "192.168.1.1"
+dns_servers     = ["1.1.1.1", "8.8.8.8"]
+
+# Master VM
+master_vm_name   = "k8s-master-01"
+master_hostname  = "k8s-master-01"
+master_vm_id     = 200
+master_ip        = "192.168.1.200"
+master_cpu_cores = 2
+master_memory    = 2048
+master_disk_size = 30
+
+# Worker VMs
+worker_count     = 2
+worker_names     = ["k8s-worker-01", "k8s-worker-02"]
+worker_hostnames = ["k8s-worker-01", "k8s-worker-02"]
+worker_ids       = [201, 202]
+worker_ips       = ["192.168.1.201", "192.168.1.202"]
+worker_cpu_cores = 2
+worker_memory    = 4608
+worker_disk_size = 50
+# Proxmox Provider Variables
+variable "proxmox_api_url" {
+  type = string
+}
+
+variable "proxmox_api_token" {
+  type      = string
+  sensitive = true
+}
+
+variable "proxmox_node" {
+  type    = string
+  default = "pve"
+}
+
+variable "template_id" {
+  type    = number
+  default = 100
+}
+
+# Storage & Network Variables
+variable "storage_datastore" {
+  type    = string
+  default = "hdd1tb"
+}
+
+variable "snippet_datastore" {
+  type    = string
+  default = "hdd1tb"
+}
+
+variable "network_bridge" {
+  type    = string
+  default = "vmbr0"
+}
+
+variable "network_gateway" {
+  type    = string
+  default = "192.168.1.1"
+}
+
+variable "dns_servers" {
+  type    = list(string)
+  default = ["1.1.1.1", "8.8.8.8"]
+}
+
+# Master Node Variables
+variable "master_vm_name" {
+  type    = string
+  default = "k8s-master-01"
+}
+
+variable "master_hostname" {
+  type    = string
+  default = "k8s-master-01"
+}
+
+variable "master_vm_id" {
+  type    = number
+  default = 200
+}
+
+variable "master_ip" {
+  type    = string
+  default = "192.168.1.200"
+}
+
+variable "master_cpu_cores" {
+  type    = number
+  default = 2
+}
+
+variable "master_memory" {
+  type    = number
+  default = 2048
+}
+
+variable "master_disk_size" {
+  type    = number
+  default = 30
+}
+
+# Worker Nodes Variables
+variable "worker_count" {
+  type    = number
+  default = 2
+}
+
+variable "worker_names" {
+  type    = list(string)
+  default = ["k8s-worker-01", "k8s-worker-02"]
+}
+
+variable "worker_hostnames" {
+  type    = list(string)
+  default = ["k8s-worker-01", "k8s-worker-02"]
+}
+
+variable "worker_ids" {
+  type    = list(number)
+  default = [201, 202]
+}
+
+variable "worker_ips" {
+  type    = list(string)
+  default = ["192.168.1.201", "192.168.1.202"]
+}
+
+variable "worker_cpu_cores" {
+  type    = number
+  default = 2
+}
+
+variable "worker_memory" {
+  type    = number
+  default = 4608
+}
+
+variable "worker_disk_size" {
+  type    = number
+  default = 50
+}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: monitoring
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: grafana.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: monitoring-grafana
+                port:
+                  number: 80
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-api
+  namespace: payment-system
+  labels:
+    app: payment-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment-api
+  template:
+    metadata:
+      labels:
+        app: payment-api
+    spec:
+      initContainers:
+        - name: db-migration
+          image: postgres:15-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until psql "postgresql://payuser:PaySecurePassword123!@postgres:5432/paymentdb" -c '\q'; do
+                echo "Waiting for PostgreSQL database to be ready..."
+                sleep 2
+              done
+              echo "Creating transactions table..."
+              psql "postgresql://payuser:PaySecurePassword123!@postgres:5432/paymentdb" -c "
+                CREATE TABLE IF NOT EXISTS transactions (
+                  id SERIAL PRIMARY KEY,
+                  account_id VARCHAR(50),
+                  amount DECIMAL(10,2),
+                  status VARCHAR(20),
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );"
+      containers:
+        - name: payment-api
+          image: ghcr.io/arunkk98/payment-api:latest
+          ports:
+            - containerPort: 5678
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5678
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5678
+            initialDelaySeconds: 10
+            periodSeconds: 15
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: payment-ingress
+  namespace: payment-system
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: payment.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: payment-api-service
+                port:
+                  number: 80
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-api-service
+  namespace: payment-system
+  labels:
+    app: payment-api
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 5678
+      protocol: TCP
+      name: http
+  selector:
+    app: payment-api
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-frontend
+  namespace: payment-system
+  labels:
+    app: payment-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-frontend
+  template:
+    metadata:
+      labels:
+        app: payment-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-frontend-service
+  namespace: payment-system
+  labels:
+    app: payment-frontend
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 80
+  selector:
+    app: payment-frontend
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: payment-system
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/arunkk98/paymentapp.git'
+    targetRevision: HEAD
+    path: paymentapp-gitops/apps
+    directory:
+      recurse: true
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: payment-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 5678;
+
+app.use(express.json());
+
+// Liveness / Readiness probe endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'UP', service: 'payment-api', timestamp: new Date() });
+});
+
+// Mock transfer endpoint
+app.post('/transfer', (req, res) => {
+  const { sender, recipient, amount } = req.body;
+  if (!sender || !recipient || !amount) {
+    return res.status(400).json({ error: 'Missing required fields: sender, recipient, amount' });
+  }
+
+  res.status(200).json({
+    transactionId: `TXN-${Math.random().toString(36).substring(2, 11).toUpperCase()}`,
+    status: 'SUCCESS',
+    details: { sender, recipient, amount, currency: 'USD' },
+    message: 'Payment processed successfully'
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Payment API listening on port ${PORT}`);
+});
+// trigger rebuild
+# Stage 1: Build dependencies
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --only=production
+
+# Stage 2: Production runtime image
+FROM node:18-alpine
+WORKDIR /app
+USER node
+COPY --chown=node:node --from=builder /app/node_modules ./node_modules
+COPY --chown=node:node app.js package.json ./
+
+EXPOSE 5678
+CMD ["node", "app.js"]
+{
+  "name": "payment-api",
+  "version": "1.0.0",
+  "description": "Mock Fintech Payment API Service",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

@@ -1,12 +1,13 @@
 {
-  "name": "payment-api",
+  "name": "payment-service",
   "version": "1.0.0",
-  "description": "Mock Fintech Payment API Service",
+  "description": "Payment Processing Service",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
   },
   "dependencies": {
+    "amqplib": "^0.10.3",
     "express": "^4.18.2"
   }
 }

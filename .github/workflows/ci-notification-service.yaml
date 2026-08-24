@@ -1,0 +1,99 @@
+name: Notification Service CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/notification-service/**'
+      - '.github/workflows/ci-notification-service.yaml'
+
+permissions:
+  contents: write
+  packages: write
+  security-events: write
+
+jobs:
+  test-and-scan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/notification-service
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Test (if configured)
+        run: npm test --if-present
+
+  build-scan-deploy:
+    needs: test-and-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/notification-service
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: src/notification-service
+          file: src/notification-service/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/notification-service:${{ steps.meta.outputs.version }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Update Kustomize Dev Overlay Tag & Commit
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git pull origin main --rebase
+          
+          cd paymentapp-gitops/apps/notification-service/overlays/dev
+          kustomize edit set image ghcr.io/${{ github.repository_owner }}/notification-service=ghcr.io/${{ github.repository_owner }}/notification-service:${{ steps.meta.outputs.version }}
+          
+          git add kustomization.yaml
+          git commit -m "ci(notification-service): update image tag to ${{ steps.meta.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git push origin main

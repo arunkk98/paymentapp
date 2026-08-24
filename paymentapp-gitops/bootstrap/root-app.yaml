@@ -1,19 +1,19 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: payment-system
+  name: root-application
   namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
   source:
     repoURL: 'https://github.com/arunkk98/paymentapp.git'
-    targetRevision: HEAD
-    path: paymentapp-gitops/apps
-    directory:
-      recurse: true
+    targetRevision: main
+    path: paymentapp-gitops/bootstrap/templates
   destination:
     server: 'https://kubernetes.default.svc'
-    namespace: payment-system
+    namespace: argocd
   syncPolicy:
     automated:
       prune: true
