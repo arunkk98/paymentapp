@@ -1,15 +1,4 @@
-# Ignore Terraform state files and credentials
-*.tfstate
-*.tfstate.*
-.terraform/
-terraform.tfvars
-
-# Ignore Ansible temporary files and retry logs
-*.retry
-*.log
-/tmp/join-command.txt
-
-# Ignore OS / Editor files
-.DS_Store
-.idea/
-.vscode/
+node_modules/
+**/node_modules/
+.env
+coverage/
