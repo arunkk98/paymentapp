@@ -4,9 +4,10 @@ kind: Kustomization
 namespace: payment-system
 
 resources:
-  - ../../base
-  - ingress.yaml
+- ../../base
+- ingress.yaml
 
 images:
-  - name: ghcr.io/arunkk98/payment-service
-    newTag: latest
+- name: ghcr.io/arunkk98/payment-service
+  newName: ghcr.io/arunkk98/payment-service
+  newTag: latest
