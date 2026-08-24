@@ -6,40 +6,45 @@ on:
   pull_request:
     branches: [ main ]
 
+# Enforce least-privilege token permissions
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   security-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.1.7
         with:
-          fetch-depth: 0 # Full history needed for SonarQube analysis
+          fetch-depth: 0
 
-      # 1. SAST Code Analysis (Cloud-based, 0 cluster load)
+      # 1. SAST Code Analysis (Pinned to release tag)
       - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@master
+        uses: SonarSource/sonarcloud-github-action@v2.3.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      # 2. Build Docker Image locally inside CI runner
+      # 2. Build Docker Image locally
       - name: Build Payment Service Image
         run: |
           docker build -t payment-service:${{ github.sha }} src/payment-service
 
-      # 3. Trivy Vulnerability Scan on Built Image
+      # 3. Trivy Vulnerability Scan (Pinned to release tag)
       - name: Run Trivy Vulnerability Scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: 'payment-service:${{ github.sha }}'
           format: 'table'
-          exit-code: '1' # Fails CI if HIGH or CRITICAL CVEs exist
+          exit-code: '1'
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
 
       # 4. Push to Registry ONLY if all scans pass
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v3.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
