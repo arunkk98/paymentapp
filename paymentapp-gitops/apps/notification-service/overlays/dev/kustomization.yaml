@@ -4,8 +4,9 @@ kind: Kustomization
 namespace: payment-system
 
 resources:
-  - ../../base
+- ../../base
 
 images:
-  - name: ghcr.io/arunkk98/notification-service
-    newTag: latest
+- name: ghcr.io/arunkk98/notification-service
+  newName: ghcr.io/arunkk98/notification-service
+  newTag: latest
